@@ -114,7 +114,9 @@ export function listServers(apps = APPS, stashFile = STASH) {
 
 // An entry is written to its new home before it's removed from the old one,
 // so a failed write can leave it in both places but never in neither.
-// Returns the writes made, in order, as { file, change }.
+// Returns the writes made, in order, as { file, change }. A write is recorded
+// only once it has finished; if one fails, the error carries the writes that
+// completed before it as e.writes.
 export function setServer(app, name, on, stashFile = STASH) {
   const config = readJson(app.file);
   const live = (config.data.mcpServers ??= {});
@@ -125,31 +127,46 @@ export function setServer(app, name, on, stashFile = STASH) {
   if (!isLive && !isParked) throw new Error(`${app.label} has no MCP server named "${name}"`);
 
   const writes = [];
+  const save = (file, doc, change) => {
+    try {
+      (file === stashFile ? saveStash : writeJson)(file, doc);
+    } catch (e) {
+      e.writes = writes;
+      e.message = `${path.basename(file)} ${change} failed: ${e.message}`;
+      throw e;
+    }
+    writes.push({ file, change });
+  };
   if (on && !isLive) {
     live[name] = parked[name];
-    writeJson(app.file, config);
-    writes.push({ file: app.file, change: `+mcpServers.${name}` });
+    save(app.file, config, `+mcpServers.${name}`);
   }
   if (on && isParked) {
     delete parked[name];
-    saveStash(stashFile, stash);
-    writes.push({ file: stashFile, change: `-${app.id}.${name}` });
+    save(stashFile, stash, `-${app.id}.${name}`);
   }
   if (!on && isLive) {
     parked[name] = live[name];
-    saveStash(stashFile, stash);
-    writes.push({ file: stashFile, change: `+${app.id}.${name}` });
+    save(stashFile, stash, `+${app.id}.${name}`);
     delete live[name];
-    writeJson(app.file, config);
-    writes.push({ file: app.file, change: `-mcpServers.${name}` });
+    save(app.file, config, `-mcpServers.${name}`);
   }
   return writes;
 }
 
 export function allOff(apps = APPS, stashFile = STASH) {
-  return listServers(apps, stashFile).flatMap((app) =>
-    app.servers.filter((s) => s.on).flatMap((s) => setServer(app, s.name, false, stashFile)),
-  );
+  const writes = [];
+  for (const app of listServers(apps, stashFile)) {
+    for (const server of app.servers.filter((s) => s.on)) {
+      try {
+        writes.push(...setServer(app, server.name, false, stashFile));
+      } catch (e) {
+        e.writes = [...writes, ...(e.writes ?? [])];
+        throw e;
+      }
+    }
+  }
+  return writes;
 }
 
 const style = (code) => (s) => `\x1b[${code}m${s}\x1b[0m`;
@@ -177,6 +194,9 @@ function fit(text, width) {
 export const describeWrites = (writes) =>
   writes.length ? writes.map((w) => `${path.basename(w.file)} ${w.change}`).join('  ->  ') : 'nothing to change';
 
+// What a failed switch actually wrote before the error.
+const describeFailure = (e) => `${e.writes?.length ? describeWrites(e.writes) + '  ->  ' : ''}failed`;
+
 const rowsOf = (groups) => groups.flatMap((app) => app.servers.map((server) => ({ app, server })));
 
 export function render(groups, cursor, message, fileLine, width = 100) {
@@ -198,7 +218,7 @@ export function render(groups, cursor, message, fileLine, width = 100) {
   }
   lines.push(
     message,
-    dim(fit(` file: ${fileLine}`, width - 1)),
+    fileLine ? dim(fit(` file: ${fileLine}`, width - 1)) : '',
     '',
     dim(' ↑/↓ move · space toggle · r reload · q quit'),
   );
@@ -213,7 +233,7 @@ function runInteractive() {
   let groups = listServers();
   let cursor = 0;
   let message = '';
-  let fileLine = 'nothing written yet';
+  let fileLine = '';
 
   const draw = () => {
     cursor = Math.min(Math.max(cursor, 0), Math.max(rowsOf(groups).length - 1, 0));
@@ -243,7 +263,7 @@ function runInteractive() {
           ? yellow(` ${server.name} is off for ${app.label}; ${app.restart}.`)
           : green(` ${server.name} is on for ${app.label}; ${app.restart}.`);
       } catch (e) {
-        fileLine = 'write failed';
+        fileLine = describeFailure(e);
         message = red(` ${e.message}`);
       }
       groups = listServers();
@@ -268,7 +288,7 @@ function main([command, ...args]) {
     try {
       result = describeWrites(allOff());
     } catch (e) {
-      result = `failed: ${e.message}`;
+      result = `${describeFailure(e)}: ${e.message}`;
       process.exitCode = 1;
     }
     const line = `${new Date().toISOString()} off-all: ${result}`;
@@ -285,6 +305,7 @@ function main([command, ...args]) {
       console.log(`file: ${describeWrites(writes)}`);
     } catch (e) {
       console.error(e.message);
+      console.error(`file: ${describeFailure(e)}`);
       process.exitCode = 1;
     }
     return;
