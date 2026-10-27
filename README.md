@@ -13,9 +13,12 @@ gh repo clone evancogan/mcp-toggle C:\Repos\mcp-toggle
 powershell -ExecutionPolicy Bypass -File C:\Repos\mcp-toggle\install.ps1
 ```
 
-This adds an **MCP Servers** shortcut to the desktop and a login entry
-(`MCP servers off at login` under Task Manager → Startup apps).
-`install.ps1 -Uninstall` removes both.
+This adds an **MCP Servers** shortcut to the desktop and a login reset: a
+scheduled task, `mcp-toggle off-all at log on`, that runs `off-all` with no
+window each time you sign in. If Windows won't register the task without admin
+rights, the installer puts a shortcut in the Startup folder instead, which
+Windows runs a few seconds later in sign-in. `install.ps1 -Uninstall` removes
+both.
 
 ## Use
 
