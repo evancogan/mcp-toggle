@@ -63,3 +63,15 @@ try {
   "Login reset:      Startup folder shortcut $startupLnk"
   "                  (scheduled task not registered: $($_.Exception.Message))"
 }
+
+# An app that launches itself at sign-in can read its config before the reset
+# runs and start its servers anyway.
+$appData = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData'
+$claudeStartup = Get-ChildItem $appData -ErrorAction SilentlyContinue |
+  Where-Object PSChildName -like 'Claude_*' |
+  ForEach-Object { Get-ItemProperty (Join-Path $_.PSPath 'ClaudeStartup') -ErrorAction SilentlyContinue } |
+  Where-Object State -eq 2
+if ($claudeStartup) {
+  'Warning: Claude is set to open at sign-in, so it can start before the reset and'
+  '         launch servers that were left on. Turn Claude off in Settings > Apps > Startup.'
+}

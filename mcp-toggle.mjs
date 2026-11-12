@@ -154,17 +154,29 @@ export function setServer(app, name, on, stashFile = STASH) {
   return writes;
 }
 
+// Keeps going past a failure so one bad file can't leave the other apps' servers
+// on. A config that exists but can't be read counts as a failure, since its
+// servers may still be on; a missing config just means the app isn't installed.
+// If anything failed, the error lists every failure and carries all completed
+// writes as e.writes.
 export function allOff(apps = APPS, stashFile = STASH) {
   const writes = [];
+  const failures = [];
   for (const app of listServers(apps, stashFile)) {
+    if (app.error && app.error !== 'config file not found') failures.push(`${app.label}: ${app.error}`);
     for (const server of app.servers.filter((s) => s.on)) {
       try {
         writes.push(...setServer(app, server.name, false, stashFile));
       } catch (e) {
-        e.writes = [...writes, ...(e.writes ?? [])];
-        throw e;
+        writes.push(...(e.writes ?? []));
+        failures.push(e.message);
       }
     }
+  }
+  if (failures.length) {
+    const e = new Error(failures.join('; '));
+    e.writes = writes;
+    throw e;
   }
   return writes;
 }
