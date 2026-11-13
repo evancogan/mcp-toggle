@@ -21,8 +21,12 @@ The installer adds two things:
 
 If Windows won't register the task without admin rights, the installer puts a
 shortcut in the Startup folder instead, which Windows runs a few seconds later
-in sign-in. It also warns you if Claude is set to open at sign-in (see
-[What the reset covers](#what-the-reset-covers)).
+in sign-in. It also warns you if Claude Desktop or LM Studio is set to open at
+sign-in (see [What the reset covers](#what-the-reset-covers)). It looks for the
+Store app's startup task, `Run` registry entries and Startup-folder shortcuts
+that start `claude.exe` or `LM Studio.exe`, and skips any you've turned off in
+Settings > Apps > Startup. `install.ps1 -CheckStartup` runs only that check and
+changes nothing.
 
 Run the installer again after moving the repo or reinstalling Node.js, since the
 task and shortcut point at both by full path. `install.ps1 -Uninstall` removes
@@ -69,7 +73,8 @@ servers when it opens, from whatever its config says at that moment. So:
   anything else.
 - **Not covered: apps that open at sign-in.** Claude Desktop or LM Studio set
   to open at sign-in can read its config before the reset runs and start what
-  was left on. Leave them off in Settings > Apps > Startup.
+  was left on. Leave them off in Settings > Apps > Startup. If your
+  organization's policy turns one on, Settings may not let you turn it off.
 - **Not covered: sleep and hibernate.** Waking the PC isn't a sign-in, so the
   reset doesn't run and running servers keep running. Shutting down and
   restarting both sign you in again, Fast Startup included.
@@ -117,7 +122,8 @@ and run `off-all` again.
 
 **A server is still running after sign-in.** Its app probably opened before the
 reset. Quit the app (for Claude Desktop, from the tray), check `list` shows the
-server off, and reopen it. Then take the app out of Settings > Apps > Startup.
+server off, and reopen it. Then take the app out of Settings > Apps > Startup,
+and run `install.ps1 -CheckStartup` to confirm nothing else opens it.
 
 **A server is missing from the list.** It's one of the kinds the switchboard
 doesn't see (see [What the reset covers](#what-the-reset-covers)), or the app's
