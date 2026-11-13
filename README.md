@@ -53,7 +53,9 @@ Switching a server off moves its entry from the app's config into
 `~/.mcp-toggle/disabled.json`; switching it on moves it back. The rest of each
 config file is left byte-for-byte as it was. An entry is written to its new home
 before it's removed from the old one, so a failed write can leave it in both
-places but never lose it.
+places but never lose it. Each file is written to a temp file beside it and
+then renamed into place, so a crash or power cut mid-write leaves the old file
+whole.
 
 | App | Config |
 |---|---|
@@ -61,8 +63,9 @@ places but never lose it.
 | Claude Code | `~/.claude.json` (user-scope servers) |
 | LM Studio / Bionic | `~/.lmstudio/mcp.json` |
 
-`off-all` switches off every server in all three. If one config can't be read or
-written, it still switches off everything else, then logs each failure.
+`off-all` switches off every server in all three, with one write to
+`disabled.json` and one to the config for each app. If one config can't be read
+or written, it still switches off everything else, then logs each failure.
 
 ## What the reset covers
 
@@ -116,6 +119,13 @@ the installer used the Startup folder instead, look for
 app was writing it at the same moment. Run `node mcp-toggle.mjs off-all` once
 the app has finished starting; it only touches servers that are still on.
 
+**`disabled.json was damaged ... moved to disabled.json.corrupt-...` in the
+log.** `disabled.json` couldn't be read as a list of parked servers (often a
+write cut short), so `off-all` set it aside and started a new one before
+switching everything off. Servers that were parked in the old file no longer
+show in the list. To get one back, copy its entry from the `.corrupt-` file into
+the app's `mcpServers`; it then shows as on.
+
 **`... failed: EPERM` or `EBUSY` in the log.** Another program had the file
 locked, or it's read-only. Everything else was still switched off. Fix the file
 and run `off-all` again.
@@ -129,3 +139,11 @@ and run `install.ps1 -CheckStartup` to confirm nothing else opens it.
 doesn't see (see [What the reset covers](#what-the-reset-covers)), or the app's
 config is somewhere else. `list` shows `config file not found` for an app whose
 file isn't where the table above says.
+
+## Tests
+
+```powershell
+node --test
+```
+
+The tests work on temp files only; they never read or change your configs.

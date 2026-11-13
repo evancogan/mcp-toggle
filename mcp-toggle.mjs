@@ -20,6 +20,7 @@ const HOME = os.homedir();
 const SCRIPT = fileURLToPath(import.meta.url);
 export const STASH = path.join(HOME, '.mcp-toggle', 'disabled.json');
 const OFF_ALL_LOG = path.join(HOME, '.mcp-toggle', 'off-all.log');
+const BOM = '\uFEFF';
 
 // The Store build of Claude keeps its config under %LOCALAPPDATA%\Claude-Data\claude_<id>;
 // the classic installer uses %APPDATA%\Claude.
@@ -60,26 +61,81 @@ export const APPS = [
 function readJson(file) {
   const text = fs.readFileSync(file, 'utf8');
   return {
-    data: JSON.parse(text.replace(/^﻿/, '')),
-    bom: text.startsWith('﻿'),
+    data: JSON.parse(text.startsWith(BOM) ? text.slice(1) : text),
+    bom: text.startsWith(BOM),
     eol: text.includes('\r\n') ? '\r\n' : '\n',
     finalEol: /\n$/.test(text),
   };
 }
 
+// Names the file in a read error, the way a failed save is named.
+function readNamed(file, read) {
+  try {
+    return read(file);
+  } catch (e) {
+    e.message = `${path.basename(file)} read failed: ${e.message}`;
+    throw e;
+  }
+}
+
+const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// On Windows a virus scanner or indexer can hold a just-written file for a
+// moment, which makes the rename fail; try again for about a second.
+function renameRetrying(from, to) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return fs.renameSync(from, to);
+    } catch (e) {
+      if (attempt >= 10 || !['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) throw e;
+      pause(100);
+    }
+  }
+}
+
+// Written to a temp file beside the target and renamed over it, so a crash or
+// power cut mid-write leaves the old file whole rather than cut short.
 function writeJson(file, doc) {
   let text = JSON.stringify(doc.data, null, 2);
   if (doc.eol !== '\n') text = text.replaceAll('\n', doc.eol);
-  fs.writeFileSync(file, (doc.bom ? '﻿' : '') + text + (doc.finalEol ? doc.eol : ''));
-}
-
-function readStash(file) {
+  const content = (doc.bom ? BOM : '') + text + (doc.finalEol ? doc.eol : '');
+  let target = file;
   try {
-    return readJson(file);
+    target = fs.realpathSync(file); // write through a symlink, not over it
+  } catch {}
+  const temp = `${target}.mcp-toggle-${process.pid}.tmp`;
+  try {
+    const fd = fs.openSync(temp, 'w');
+    try {
+      fs.writeFileSync(fd, content);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    renameRetrying(temp, target);
   } catch (e) {
-    if (e.code === 'ENOENT') return { data: {}, bom: false, eol: '\n', finalEol: true };
+    fs.rmSync(temp, { force: true });
     throw e;
   }
+}
+
+const isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// A stash that can't be parsed, or isn't shaped like one, is marked corrupt
+// (as opposed to unreadable, say because another program has it locked).
+function readStash(file) {
+  let stash;
+  try {
+    stash = readJson(file);
+  } catch (e) {
+    if (e.code === 'ENOENT') return { data: {}, bom: false, eol: '\n', finalEol: true };
+    if (e instanceof SyntaxError) e.corrupt = true;
+    throw e;
+  }
+  if (!isMap(stash.data) || !Object.values(stash.data).every(isMap)) {
+    throw Object.assign(new Error('not a list of parked servers'), { corrupt: true });
+  }
+  return stash;
 }
 
 function saveStash(file, stash) {
@@ -90,15 +146,43 @@ function saveStash(file, stash) {
   writeJson(file, stash);
 }
 
+// A corrupt stash would stop every server from being switched off. Move it
+// aside, keeping whatever was parked in it, so a new one can start. Returns
+// the move as a write record, or nothing if the stash was fine.
+function setAsideCorruptStash(stashFile) {
+  let reason;
+  try {
+    readStash(stashFile);
+    return [];
+  } catch (e) {
+    if (!e.corrupt) {
+      e.message = `${path.basename(stashFile)} read failed: ${e.message}`;
+      throw e;
+    }
+    reason = e.message;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  let aside = `${stashFile}.corrupt-${stamp}`;
+  for (let n = 2; fs.existsSync(aside); n++) aside = `${stashFile}.corrupt-${stamp}-${n}`;
+  try {
+    renameRetrying(stashFile, aside);
+  } catch (e) {
+    e.message = `${path.basename(stashFile)} is damaged (${reason}) and couldn't be moved aside: ${e.message}`;
+    throw e;
+  }
+  return [{ file: stashFile, change: `was damaged (${reason}); moved to ${path.basename(aside)}` }];
+}
+
 export function listServers(apps = APPS, stashFile = STASH) {
-  const stash = readStash(stashFile).data;
+  const stash = readNamed(stashFile, readStash).data;
   return apps.map((app) => {
     let live;
     try {
       live = readJson(app.file).data.mcpServers ?? {};
     } catch (e) {
-      const error = e.code === 'ENOENT' ? 'config file not found' : `can't read config: ${e.message}`;
-      return { ...app, error, servers: [] };
+      const missing = e.code === 'ENOENT';
+      const error = missing ? 'config file not found' : `can't read config: ${e.message}`;
+      return { ...app, error, missing, servers: [] };
     }
     const parked = stash[app.id] ?? {};
     // Sorted so a server keeps its row when it moves between the config and the stash.
@@ -108,24 +192,14 @@ export function listServers(apps = APPS, stashFile = STASH) {
       on: Object.hasOwn(live, name),
       entry: live[name] ?? parked[name],
     }));
-    return { ...app, error: null, servers };
+    return { ...app, error: null, missing: false, servers };
   });
 }
 
-// An entry is written to its new home before it's removed from the old one,
-// so a failed write can leave it in both places but never in neither.
-// Returns the writes made, in order, as { file, change }. A write is recorded
-// only once it has finished; if one fails, the error carries the writes that
+// Records each finished write as { file, change }. If a write fails, its
+// error is prefixed with the file and change, and carries the writes that
 // completed before it as e.writes.
-export function setServer(app, name, on, stashFile = STASH) {
-  const config = readJson(app.file);
-  const live = (config.data.mcpServers ??= {});
-  const stash = readStash(stashFile);
-  const parked = (stash.data[app.id] ??= {});
-  const isLive = Object.hasOwn(live, name);
-  const isParked = Object.hasOwn(parked, name);
-  if (!isLive && !isParked) throw new Error(`${app.label} has no MCP server named "${name}"`);
-
+function writeRecorder(stashFile) {
   const writes = [];
   const save = (file, doc, change) => {
     try {
@@ -137,6 +211,22 @@ export function setServer(app, name, on, stashFile = STASH) {
     }
     writes.push({ file, change });
   };
+  return { writes, save };
+}
+
+// An entry is written to its new home before it's removed from the old one,
+// so a failed write can leave it in both places but never in neither.
+// Returns the writes made, in order, as { file, change }.
+export function setServer(app, name, on, stashFile = STASH) {
+  const config = readNamed(app.file, readJson);
+  const live = (config.data.mcpServers ??= {});
+  const stash = readNamed(stashFile, readStash);
+  const parked = (stash.data[app.id] ??= {});
+  const isLive = Object.hasOwn(live, name);
+  const isParked = Object.hasOwn(parked, name);
+  if (!isLive && !isParked) throw new Error(`${app.label} has no MCP server named "${name}"`);
+
+  const { writes, save } = writeRecorder(stashFile);
   if (on && !isLive) {
     live[name] = parked[name];
     save(app.file, config, `+mcpServers.${name}`);
@@ -154,23 +244,46 @@ export function setServer(app, name, on, stashFile = STASH) {
   return writes;
 }
 
+// Switches off every server that is on in one app: one stash write parks them
+// all, then one config write removes them, so the same rule holds as in
+// setServer. Reads the config afresh, so a server the app added since
+// listServers is caught too.
+function parkAll(app, stashFile) {
+  const config = readNamed(app.file, readJson);
+  const live = config.data.mcpServers ?? {};
+  const names = Object.keys(live);
+  if (!names.length) return [];
+  const stash = readNamed(stashFile, readStash);
+  const parked = (stash.data[app.id] ??= {});
+
+  const { writes, save } = writeRecorder(stashFile);
+  for (const name of names) parked[name] = live[name];
+  save(stashFile, stash, names.map((name) => `+${app.id}.${name}`).join(' '));
+  for (const name of names) delete live[name];
+  save(app.file, config, names.map((name) => `-mcpServers.${name}`).join(' '));
+  return writes;
+}
+
 // Keeps going past a failure so one bad file can't leave the other apps' servers
 // on. A config that exists but can't be read counts as a failure, since its
 // servers may still be on; a missing config just means the app isn't installed.
-// If anything failed, the error lists every failure and carries all completed
-// writes as e.writes.
+// A corrupt stash is moved aside first. If anything failed, the error lists
+// every failure and carries all completed writes as e.writes.
 export function allOff(apps = APPS, stashFile = STASH) {
-  const writes = [];
+  const writes = setAsideCorruptStash(stashFile);
   const failures = [];
   for (const app of listServers(apps, stashFile)) {
-    if (app.error && app.error !== 'config file not found') failures.push(`${app.label}: ${app.error}`);
-    for (const server of app.servers.filter((s) => s.on)) {
-      try {
-        writes.push(...setServer(app, server.name, false, stashFile));
-      } catch (e) {
-        writes.push(...(e.writes ?? []));
-        failures.push(e.message);
-      }
+    if (app.missing) continue;
+    if (app.error) {
+      failures.push(`${app.label}: ${app.error}`);
+      continue;
+    }
+    if (!app.servers.some((s) => s.on)) continue;
+    try {
+      writes.push(...parkAll(app, stashFile));
+    } catch (e) {
+      writes.push(...(e.writes ?? []));
+      failures.push(`${app.label}: ${e.message}`);
     }
   }
   if (failures.length) {
