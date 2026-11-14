@@ -1,9 +1,26 @@
 # Uninstalling mcp-toggle
 
-Steps to undo everything mcp-toggle did to a Windows machine and leave it on
-stock settings. Do them in order. Step 1 matters most: servers the sign-in reset
-switched off live only in `~/.mcp-toggle/disabled.json`, and the uninstaller
-does not put them back.
+## The quick way
+
+Quit Claude (Claude Desktop: from the tray) and LM Studio, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Repos\mcp-toggle\uninstall.ps1
+```
+
+It backs up every file it will change to `~\.mcp-toggle-backup\<time>`, puts
+parked servers back into their apps' configs, removes the desktop shortcut and
+the sign-in reset, checks that everything is back, and only then deletes
+`~\.mcp-toggle`. If any step fails it keeps your data and says what to fix; it
+is safe to run again. `-Yes` skips the confirmation and `-KeepData` leaves
+`~\.mcp-toggle` in place. The backup can contain server settings such as API
+keys, so delete it once your servers work.
+
+## By hand
+
+The same steps, done manually. Do them in order. Step 2 matters most: servers
+the sign-in reset switched off live only in `~/.mcp-toggle/disabled.json`, and
+`install.ps1 -Uninstall` does not put them back.
 
 ## What mcp-toggle changes
 
