@@ -5,9 +5,10 @@
 # Every file it will change is copied to ~\.mcp-toggle-backup\<time> first, and
 # nothing is deleted unless a final check shows the servers are back.
 #
+#   -DryRun     only report what would happen; change nothing, back up nothing
 #   -Yes        don't ask before starting
 #   -KeepData   leave ~\.mcp-toggle (the parked-server list and logs) in place
-param([switch]$Yes, [switch]$KeepData)
+param([switch]$DryRun, [switch]$Yes, [switch]$KeepData)
 
 $ErrorActionPreference = 'Stop'
 
@@ -83,6 +84,63 @@ $files += @{ Name = 'off-all.log'; Path = (Join-Path $stateDir 'off-all.log') }
 $open = @()
 if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) { $open += 'Claude' }
 if (Get-Process -Name 'LM Studio' -ErrorAction SilentlyContinue) { $open += 'LM Studio' }
+
+if ($DryRun) {
+  Write-Host '  Dry run: reading only, nothing will be changed.' -ForegroundColor Cyan
+  Write-Host ''
+  Write-Host '  App configs:'
+  foreach ($app in $apps) {
+    if (-not (Test-Path -LiteralPath $app.file)) { Write-Host ("    {0,-9} not found ({1})" -f $app.id, $app.file); continue }
+    try {
+      $config = (Get-Content -LiteralPath $app.file -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
+      $count = if ($config.mcpServers) { @($config.mcpServers.PSObject.Properties).Count } else { 0 }
+      Write-Host ("    {0,-9} {1} server(s) on now ({2})" -f $app.id, $count, $app.file)
+    } catch {
+      Write-Host ("    {0,-9} can't be read: {1}" -f $app.id, $_.Exception.Message) -ForegroundColor Yellow
+    }
+  }
+  Write-Host ''
+  Write-Host '  Parked servers to put back:'
+  $anyParked = $false
+  if (Test-Path -LiteralPath $stash) {
+    try {
+      $parked = Get-Content -LiteralPath $stash -Raw | ConvertFrom-Json
+      foreach ($app in $parked.PSObject.Properties) {
+        $target = $apps | Where-Object { $_.id -eq $app.Name }
+        $ready = $target -and (Test-Path -LiteralPath $target.file)
+        foreach ($server in $app.Value.PSObject.Properties) {
+          $anyParked = $true
+          if ($ready) { Write-Host ("    {0}/{1}  -> restored into {2}" -f $app.Name, $server.Name, $target.file) }
+          else { Write-Host ("    {0}/{1}  -> CAN'T restore: that app's config file doesn't exist" -f $app.Name, $server.Name) -ForegroundColor Yellow }
+        }
+      }
+    } catch {
+      Write-Host "    the parked-server list can't be read: $($_.Exception.Message)" -ForegroundColor Yellow
+      $anyParked = $true
+    }
+  }
+  if (-not $anyParked) { Write-Host '    none' }
+  Write-Host ''
+  Write-Host '  Would be removed:'
+  $items = @(
+    @{ What = "scheduled task '$taskName'"; Exists = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) }
+    @{ What = "Startup-folder shortcut $startupLnk"; Exists = (Test-Path -LiteralPath $startupLnk) }
+    @{ What = "desktop shortcut $desktopLnk"; Exists = (Test-Path -LiteralPath $desktopLnk) }
+    @{ What = "old Run entry '$runName'"; Exists = [bool](Get-ItemProperty $runKey -Name $runName -ErrorAction SilentlyContinue) }
+    @{ What = "folder $stateDir (after a passing check)"; Exists = (Test-Path -LiteralPath $stateDir) }
+  )
+  $anyItem = $false
+  foreach ($item in $items) { if ($item.Exists) { $anyItem = $true; Write-Host ("    " + $item.What) } }
+  if (-not $anyItem) { Write-Host '    nothing is installed' }
+  if ($open) {
+    Write-Host ''
+    $verb = if ($open.Count -gt 1) { 'are' } else { 'is' }
+    Write-Host ("  Note: {0} {1} running. Quit before the real run." -f ($open -join ' and '), $verb) -ForegroundColor Yellow
+  }
+  Write-Host ''
+  Write-Host '  Nothing was changed. Run again without -DryRun to uninstall.'
+  exit 0
+}
 
 Write-Host '  This will:'
 Write-Host '    1. back up your app configs and the parked-server list'

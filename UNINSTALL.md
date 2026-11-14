@@ -12,8 +12,10 @@ It backs up every file it will change to `~\.mcp-toggle-backup\<time>`, puts
 parked servers back into their apps' configs, removes the desktop shortcut and
 the sign-in reset, checks that everything is back, and only then deletes
 `~\.mcp-toggle`. If any step fails it keeps your data and says what to fix; it
-is safe to run again. `-Yes` skips the confirmation and `-KeepData` leaves
-`~\.mcp-toggle` in place. The backup can contain server settings such as API
+is safe to run again. `-DryRun` only reports what it would restore and remove
+(server names, never their settings) and changes nothing, so run that first if
+you want to see what's there. `-Yes` skips the confirmation and `-KeepData`
+leaves `~\.mcp-toggle` in place. The backup can contain server settings such as API
 keys, so delete it once your servers work.
 
 ## By hand
