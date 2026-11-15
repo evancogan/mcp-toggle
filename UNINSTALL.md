@@ -2,10 +2,10 @@
 
 ## The quick way
 
-Quit Claude (Claude Desktop: from the tray) and LM Studio, then run:
+Quit Claude (Claude Desktop: from the tray) and LM Studio, then run this from the repo folder:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Repos\mcp-toggle\uninstall.ps1
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
 It backs up every file it will change to `~\.mcp-toggle-backup\<time>`, puts
@@ -17,12 +17,6 @@ is safe to run again. `-DryRun` only reports what it would restore and remove
 you want to see what's there. `-Yes` skips the confirmation and `-KeepData`
 leaves `~\.mcp-toggle` in place. The backup can contain server settings such as API
 keys, so delete it once your servers work.
-
-## By hand
-
-The same steps, done manually. Do them in order. Step 2 matters most: servers
-the sign-in reset switched off live only in `~/.mcp-toggle/disabled.json`, and
-`install.ps1 -Uninstall` does not put them back.
 
 ## What mcp-toggle changes
 
@@ -36,13 +30,19 @@ the sign-in reset switched off live only in `~/.mcp-toggle/disabled.json`, and
 
 It changes nothing else: no other Windows settings, startup entries or services.
 
-## 1. Quit the apps
+## By hand
+
+The same steps, done manually. Do them in order. Step 2 matters most: servers
+the sign-in reset switched off live only in `~/.mcp-toggle/disabled.json`, and
+`install.ps1 -Uninstall` does not put them back.
+
+### 1. Quit the apps
 
 Quit Claude Desktop (from the tray), any open Claude Code sessions, and LM
 Studio. A running app can overwrite a config file you've just edited with an
 older copy it has in memory, which would undo step 2.
 
-## 2. Put parked servers back
+### 2. Put parked servers back
 
 From the repo folder:
 
@@ -69,17 +69,17 @@ node mcp-toggle.mjs list
 Every server you want should now show `on`. Skip any you no longer need; they
 disappear when you delete `~/.mcp-toggle` in step 5.
 
-## 3. Remove the shortcut and the sign-in reset
+### 3. Remove the shortcut and the sign-in reset
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Repos\mcp-toggle\install.ps1 -Uninstall
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```
 
 This deletes the desktop shortcut and removes the scheduled task, the
 Startup-folder shortcut and the old `Run` registry entry, whichever exist. It
 prints `Removed the desktop shortcut and the login reset.`
 
-## 4. Check the reset is gone
+### 4. Check the reset is gone
 
 ```powershell
 Get-ScheduledTask 'mcp-toggle off-all at log on' -ErrorAction SilentlyContinue
@@ -94,7 +94,7 @@ task is still there (this can need an admin PowerShell):
 Unregister-ScheduledTask -TaskName 'mcp-toggle off-all at log on' -Confirm:$false
 ```
 
-## 5. Delete the leftover files
+### 5. Delete the leftover files
 
 Only after step 2, because `disabled.json` holds any servers you didn't restore:
 
@@ -102,10 +102,10 @@ Only after step 2, because `disabled.json` holds any servers you didn't restore:
 Remove-Item -Recurse "$env:USERPROFILE\.mcp-toggle"
 ```
 
-Then, if you won't use it again, delete the repo folder (`C:\Repos\mcp-toggle`).
+Then, if you won't use it again, delete the repo folder.
 Keeping it costs nothing, and it is also on GitHub.
 
-## 6. Open the apps
+### 6. Open the apps
 
 On the next launch each app starts whatever is in its `mcpServers` list, as it
 would without mcp-toggle. Node.js was only a dependency, so remove it too if

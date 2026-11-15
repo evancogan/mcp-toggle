@@ -28,26 +28,18 @@ $startupLnk = Get-ShortcutPath 'Startup' 'mcp-toggle off-all.lnk'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runName = 'MCP servers off at login'
 
-# Runs one step in a background job so a / - \ | spinner can turn while it
-# works. The step returns @{ Ok; Detail; Warn }; a step that throws is a failure.
+# Runs one step inline and prints its result. The step returns
+# @{ Ok; Detail; Warn }; a step that throws or returns nothing is a failure.
 function Invoke-Step {
   param([string]$Title, [scriptblock]$Work, $Context)
-  $job = Start-Job -ScriptBlock $Work -ArgumentList $Context
-  $frames = '/', '-', '\', '|'
-  $i = 0
-  while ($job.State -eq 'Running') {
-    Write-Host ("`r  [{0}] {1}" -f $frames[$i % 4], $Title) -NoNewline
-    $i++
-    Start-Sleep -Milliseconds 100
+  Write-Host ("  [..] {0}" -f $Title) -NoNewline
+  $result = try {
+    $out = @(& $Work $Context)
+    if ($out.Count -and $out[-1] -is [System.Collections.IDictionary]) { $out[-1] }
+    else { @{ Ok = $false; Detail = 'the step produced no result' } }
+  } catch {
+    @{ Ok = $false; Detail = $_.Exception.Message }
   }
-  $out = @(Receive-Job $job -ErrorAction SilentlyContinue)
-  $result = if ($out.Count -and $out[-1] -is [System.Collections.IDictionary]) {
-    $out[-1]
-  } else {
-    $why = if ($job.ChildJobs[0].JobStateInfo.Reason) { $job.ChildJobs[0].JobStateInfo.Reason.Message } else { 'the step produced no result' }
-    @{ Ok = $false; Detail = $why }
-  }
-  Remove-Job $job -Force
   Write-Host ("`r" + (' ' * 78) + "`r") -NoNewline
   if (-not $result.Ok) {
     Write-Host '  [!!] ' -ForegroundColor Red -NoNewline
@@ -82,7 +74,8 @@ $files += @{ Name = 'disabled.json'; Path = $stash }
 $files += @{ Name = 'off-all.log'; Path = (Join-Path $stateDir 'off-all.log') }
 
 $open = @()
-if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue) { $open += 'Claude' }
+# Claude Desktop only: the Claude Code CLI is also claude.exe, but lives elsewhere.
+if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object { $_.Path -match 'AnthropicClaude|WindowsApps|\\Claude\\' }) { $open += 'Claude' }
 if (Get-Process -Name 'LM Studio' -ErrorAction SilentlyContinue) { $open += 'LM Studio' }
 
 if ($DryRun) {
@@ -104,7 +97,7 @@ if ($DryRun) {
   $anyParked = $false
   if (Test-Path -LiteralPath $stash) {
     try {
-      $parked = Get-Content -LiteralPath $stash -Raw | ConvertFrom-Json
+      $parked = (Get-Content -LiteralPath $stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
       foreach ($app in $parked.PSObject.Properties) {
         $target = $apps | Where-Object { $_.id -eq $app.Name }
         $ready = $target -and (Test-Path -LiteralPath $target.file)
@@ -176,10 +169,16 @@ $r = Invoke-Step 'Backing up configs and the parked-server list' {
     foreach ($f in $c.Files) {
       if (-not (Test-Path -LiteralPath $f.Path)) { continue }
       $dest = Join-Path $c.BackupDir $f.Name
-      Copy-Item -LiteralPath $f.Path -Destination $dest
-      if ((Get-FileHash -LiteralPath $f.Path).Hash -ne (Get-FileHash -LiteralPath $dest).Hash) {
-        throw "the copy of $($f.Name) doesn't match the original"
+      # A running app may rewrite its file mid-copy; retry a few times.
+      $ok = $false
+      for ($try = 1; $try -le 5 -and -not $ok; $try++) {
+        try {
+          Copy-Item -LiteralPath $f.Path -Destination $dest -Force
+          $ok = (Get-FileHash -LiteralPath $f.Path).Hash -eq (Get-FileHash -LiteralPath $dest).Hash
+        } catch { $ok = $false }
+        if (-not $ok) { Start-Sleep -Milliseconds 300 }
       }
+      if (-not $ok) { throw "couldn't make a matching copy of $($f.Name); it may be changing. Quit the app and retry" }
       $copied++
     }
     @{ Ok = $true; Detail = "$copied file(s) in $($c.BackupDir)" }
@@ -199,7 +198,7 @@ $r = Invoke-Step 'Restoring parked servers' {
   param($c)
   try {
     if (-not (Test-Path -LiteralPath $c.Stash)) { return @{ Ok = $true; Detail = 'nothing was parked' } }
-    $parked = Get-Content -LiteralPath $c.Stash -Raw | ConvertFrom-Json
+    $parked = (Get-Content -LiteralPath $c.Stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
     $restored = 0
     $problems = @()
     foreach ($app in $parked.PSObject.Properties) {
@@ -224,7 +223,7 @@ $r = Invoke-Step 'Removing the shortcut and sign-in reset' {
   param($c)
   try {
     $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $c.Installer -Uninstall 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw $output.Trim() }
+    if ($LASTEXITCODE -ne 0 -or $output -notmatch 'Removed the desktop shortcut') { throw $output.Trim() }
     @{ Ok = $true; Detail = '' }
   } catch {
     @{ Ok = $false; Detail = $_.Exception.Message }
@@ -239,16 +238,26 @@ $r = Invoke-Step 'Checking that everything is back' {
     $problems = @()
     $ErrorActionPreference = 'Continue'
     $listing = & $c.Node $c.Cli list 2>&1
+    $listExit = $LASTEXITCODE
+    $seen = @{}
     foreach ($line in $listing) {
-      if ("$line" -match "^(\w+)\toff\t(.+)$") { $problems += "$($Matches[2]) is still switched off in $($Matches[1])" }
+      $parts = "$line" -split "`t"
+      if ($parts.Count -ge 3 -and $parts[1] -eq 'off') {
+        $seen["$($parts[0])/$($parts[2])"] = $true
+        $problems += "$($parts[2]) is still switched off in $($parts[0])"
+      } elseif ($parts.Count -eq 2) {
+        $problems += "$($parts[0]) config problem: $($parts[1])"
+      } elseif ($parts.Count -eq 1 -and "$line".Trim()) {
+        $problems += "unexpected output from list: $("$line".Trim())"
+      }
     }
+    if ($listExit -ne 0) { $problems += "list exited with code $listExit" }
     # `list` can't see an app whose config is missing, so read the parked list itself too.
     if (Test-Path -LiteralPath $c.Stash) {
-      $left = Get-Content -LiteralPath $c.Stash -Raw | ConvertFrom-Json
+      $left = (Get-Content -LiteralPath $c.Stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
       foreach ($app in $left.PSObject.Properties) {
         foreach ($server in $app.Value.PSObject.Properties) {
-          $alreadyListed = @($problems | Where-Object { $_ -match [regex]::Escape($server.Name) }).Count -gt 0
-          if (-not $alreadyListed) { $problems += "$($server.Name) is still parked for $($app.Name)" }
+          if (-not $seen["$($app.Name)/$($server.Name)"]) { $problems += "$($server.Name) is still parked for $($app.Name)" }
         }
       }
     }
