@@ -82,14 +82,18 @@ if ($DryRun) {
   Write-Host '  Dry run: reading only, nothing will be changed.' -ForegroundColor Cyan
   Write-Host ''
   Write-Host '  App configs:'
+  # Counted by mcp-toggle itself: Windows PowerShell's ConvertFrom-Json rejects
+  # files with keys that differ only by case, which ~/.claude.json can have.
+  $listing = @(& $nodeCommand $cli list 2>&1 | ForEach-Object { "$_" })
   foreach ($app in $apps) {
     if (-not (Test-Path -LiteralPath $app.file)) { Write-Host ("    {0,-9} not found ({1})" -f $app.id, $app.file); continue }
-    try {
-      $config = (Get-Content -LiteralPath $app.file -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
-      $count = if ($config.mcpServers) { @($config.mcpServers.PSObject.Properties).Count } else { 0 }
+    $mine = @($listing | Where-Object { ($_ -split "`t")[0] -eq $app.id })
+    $err = $mine | Where-Object { ($_ -split "`t").Count -eq 2 } | Select-Object -First 1
+    if ($err) {
+      Write-Host ("    {0,-9} can't be read: {1}" -f $app.id, ($err -split "`t")[1]) -ForegroundColor Yellow
+    } else {
+      $count = @($mine | Where-Object { ($_ -split "`t")[1] -eq 'on' }).Count
       Write-Host ("    {0,-9} {1} server(s) on now ({2})" -f $app.id, $count, $app.file)
-    } catch {
-      Write-Host ("    {0,-9} can't be read: {1}" -f $app.id, $_.Exception.Message) -ForegroundColor Yellow
     }
   }
   Write-Host ''
