@@ -1,0 +1,322 @@
+# Removes mcp-toggle from this Windows user and puts everything back the way it
+# was: parked MCP servers go back into their apps' configs, the desktop shortcut
+# and the sign-in reset are removed, and the leftover files are deleted.
+#
+# Every file it will change is copied to ~\.mcp-toggle-backup\<time> first, and
+# nothing is deleted unless a final check shows the servers are back.
+#
+#   -DryRun     only report what would happen; change nothing, back up nothing
+#   -Yes        don't ask before starting
+#   -KeepData   leave ~\.mcp-toggle (the parked-server list and logs) in place
+param([switch]$DryRun, [switch]$Yes, [switch]$KeepData)
+
+$ErrorActionPreference = 'Stop'
+
+$cli = Join-Path $PSScriptRoot 'mcp-toggle.mjs'
+$installer = Join-Path $PSScriptRoot 'install.ps1'
+$stateDir = Join-Path $env:USERPROFILE '.mcp-toggle'
+$stash = Join-Path $stateDir 'disabled.json'
+$backupDir = Join-Path $env:USERPROFILE ('.mcp-toggle-backup\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$taskName = 'mcp-toggle off-all at log on'
+# An unusual profile can have no Desktop or Startup folder; then there is no shortcut to find.
+function Get-ShortcutPath($folder, $name) {
+  $dir = [Environment]::GetFolderPath($folder)
+  if ($dir) { Join-Path $dir $name } else { Join-Path $env:TEMP "no-$folder-folder\$name" }
+}
+$desktopLnk = Get-ShortcutPath 'Desktop' 'MCP Servers.lnk'
+$startupLnk = Get-ShortcutPath 'Startup' 'mcp-toggle off-all.lnk'
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$runName = 'MCP servers off at login'
+
+# Runs one step inline and prints its result. The step returns
+# @{ Ok; Detail; Warn }; a step that throws or returns nothing is a failure.
+function Invoke-Step {
+  param([string]$Title, [scriptblock]$Work, $Context)
+  Write-Host ("  [..] {0}" -f $Title) -NoNewline
+  $result = try {
+    $out = @(& $Work $Context)
+    if ($out.Count -and $out[-1] -is [System.Collections.IDictionary]) { $out[-1] }
+    else { @{ Ok = $false; Detail = 'the step produced no result' } }
+  } catch {
+    @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+  Write-Host ("`r" + (' ' * 78) + "`r") -NoNewline
+  if (-not $result.Ok) {
+    Write-Host '  [!!] ' -ForegroundColor Red -NoNewline
+  } elseif ($result.Warn) {
+    Write-Host '  [ok] ' -ForegroundColor Yellow -NoNewline
+  } else {
+    Write-Host '  [ok] ' -ForegroundColor Green -NoNewline
+  }
+  Write-Host $Title -NoNewline
+  if ($result.Detail) { Write-Host ("  - " + $result.Detail) -ForegroundColor DarkGray } else { Write-Host '' }
+  $result
+}
+
+Write-Host ''
+Write-Host '  mcp-toggle uninstall' -ForegroundColor Cyan
+Write-Host ''
+
+# Where each app keeps its config comes from mcp-toggle itself, so the two can't disagree.
+try {
+  $nodeCommand = (Get-Command node -ErrorAction Stop).Source
+  $moduleUrl = ([uri]$cli).AbsoluteUri
+  $apps = & $nodeCommand --input-type=module -e "import { APPS } from '$moduleUrl'; console.log(JSON.stringify(APPS.map(a => ({ id: a.id, file: a.file }))))" | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0 -or -not $apps) { throw 'node could not load mcp-toggle.mjs' }
+} catch {
+  Write-Host "  Can't start: $($_.Exception.Message)" -ForegroundColor Red
+  Write-Host '  mcp-toggle needs Node.js 20 or later to restore your servers. Nothing was changed.'
+  exit 1
+}
+
+$files = @($apps | ForEach-Object { @{ Name = "$($_.id)-$(Split-Path $_.file -Leaf)"; Path = $_.file } })
+$files += @{ Name = 'disabled.json'; Path = $stash }
+$files += @{ Name = 'off-all.log'; Path = (Join-Path $stateDir 'off-all.log') }
+
+$open = @()
+# Claude Desktop only: the Claude Code CLI is also claude.exe, but lives elsewhere.
+if (Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object { $_.Path -match 'AnthropicClaude|WindowsApps|\\Claude\\' }) { $open += 'Claude' }
+if (Get-Process -Name 'LM Studio' -ErrorAction SilentlyContinue) { $open += 'LM Studio' }
+
+if ($DryRun) {
+  Write-Host '  Dry run: reading only, nothing will be changed.' -ForegroundColor Cyan
+  Write-Host ''
+  Write-Host '  App configs:'
+  # Counted by mcp-toggle itself: Windows PowerShell's ConvertFrom-Json rejects
+  # files with keys that differ only by case, which ~/.claude.json can have.
+  $listing = @(& $nodeCommand $cli list 2>&1 | ForEach-Object { "$_" })
+  foreach ($app in $apps) {
+    if (-not (Test-Path -LiteralPath $app.file)) { Write-Host ("    {0,-9} not found ({1})" -f $app.id, $app.file); continue }
+    $mine = @($listing | Where-Object { ($_ -split "`t")[0] -eq $app.id })
+    $err = $mine | Where-Object { ($_ -split "`t").Count -eq 2 } | Select-Object -First 1
+    if ($err) {
+      Write-Host ("    {0,-9} can't be read: {1}" -f $app.id, ($err -split "`t")[1]) -ForegroundColor Yellow
+    } else {
+      $count = @($mine | Where-Object { ($_ -split "`t")[1] -eq 'on' }).Count
+      Write-Host ("    {0,-9} {1} server(s) on now ({2})" -f $app.id, $count, $app.file)
+    }
+  }
+  Write-Host ''
+  Write-Host '  Parked servers to put back:'
+  $anyParked = $false
+  if (Test-Path -LiteralPath $stash) {
+    try {
+      $parked = (Get-Content -LiteralPath $stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
+      foreach ($app in $parked.PSObject.Properties) {
+        $target = $apps | Where-Object { $_.id -eq $app.Name }
+        $fresh = $target -and -not (Test-Path -LiteralPath $target.file)
+        foreach ($server in $app.Value.PSObject.Properties) {
+          $anyParked = $true
+          if (-not $target) { Write-Host ("    {0}/{1}  -> CAN'T restore: mcp-toggle doesn't know an app called '{0}'" -f $app.Name, $server.Name) -ForegroundColor Yellow }
+          elseif ($fresh) { Write-Host ("    {0}/{1}  -> restored into a NEW {2} (it doesn't exist now)" -f $app.Name, $server.Name, $target.file) -ForegroundColor Yellow }
+          else { Write-Host ("    {0}/{1}  -> restored into {2}" -f $app.Name, $server.Name, $target.file) }
+        }
+      }
+    } catch {
+      Write-Host "    the parked-server list can't be read: $($_.Exception.Message)" -ForegroundColor Yellow
+      $anyParked = $true
+    }
+  }
+  if (-not $anyParked) { Write-Host '    none' }
+  Write-Host ''
+  Write-Host '  Would be removed:'
+  $items = @(
+    @{ What = "scheduled task '$taskName'"; Exists = [bool](Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) }
+    @{ What = "Startup-folder shortcut $startupLnk"; Exists = (Test-Path -LiteralPath $startupLnk) }
+    @{ What = "desktop shortcut $desktopLnk"; Exists = (Test-Path -LiteralPath $desktopLnk) }
+    @{ What = "old Run entry '$runName'"; Exists = [bool](Get-ItemProperty $runKey -Name $runName -ErrorAction SilentlyContinue) }
+    @{ What = "folder $stateDir (after a passing check)"; Exists = (Test-Path -LiteralPath $stateDir) }
+  )
+  $anyItem = $false
+  foreach ($item in $items) { if ($item.Exists) { $anyItem = $true; Write-Host ("    " + $item.What) } }
+  if (-not $anyItem) { Write-Host '    nothing is installed' }
+  if ($open) {
+    Write-Host ''
+    $verb = if ($open.Count -gt 1) { 'are' } else { 'is' }
+    Write-Host ("  Note: {0} {1} running. Quit before the real run." -f ($open -join ' and '), $verb) -ForegroundColor Yellow
+  }
+  Write-Host ''
+  Write-Host '  Nothing was changed. Run again without -DryRun to uninstall.'
+  exit 0
+}
+
+Write-Host '  This will:'
+Write-Host '    1. back up your app configs and the parked-server list'
+Write-Host '    2. put parked servers back into each app''s config'
+Write-Host '    3. remove the desktop shortcut and the sign-in reset'
+Write-Host '    4. check that everything is back'
+Write-Host '    5. delete ~\.mcp-toggle (only if the check passes)'
+Write-Host ''
+if ($open) {
+  $verb = if ($open.Count -gt 1) { 'are' } else { 'is' }
+  Write-Host ("  Warning: {0} {1} running. A running app can save an older copy of its config" -f ($open -join ' and '), $verb) -ForegroundColor Yellow
+  Write-Host '  over the restored servers. Quit it first (Claude Desktop: from the tray) for the' -ForegroundColor Yellow
+  Write-Host '  safest result. Step 4 will tell you if that happened.' -ForegroundColor Yellow
+  Write-Host ''
+}
+if (-not $Yes) {
+  $answer = Read-Host '  Continue? [y/N]'
+  if ($answer -notmatch '^(y|yes)$') {
+    Write-Host '  Nothing was changed.'
+    exit 0
+  }
+  Write-Host ''
+}
+
+$failed = $false
+
+# 1. Back up. If a copy can't be made and checked, stop before changing anything.
+$r = Invoke-Step 'Backing up configs and the parked-server list' {
+  param($c)
+  try {
+    New-Item -ItemType Directory -Force $c.BackupDir | Out-Null
+    $copied = 0
+    foreach ($f in $c.Files) {
+      if (-not (Test-Path -LiteralPath $f.Path)) { continue }
+      $dest = Join-Path $c.BackupDir $f.Name
+      # A running app may rewrite its file mid-copy; retry a few times.
+      $ok = $false
+      for ($try = 1; $try -le 5 -and -not $ok; $try++) {
+        try {
+          Copy-Item -LiteralPath $f.Path -Destination $dest -Force
+          $ok = (Get-FileHash -LiteralPath $f.Path).Hash -eq (Get-FileHash -LiteralPath $dest).Hash
+        } catch { $ok = $false }
+        if (-not $ok) { Start-Sleep -Milliseconds 300 }
+      }
+      if (-not $ok) { throw "couldn't make a matching copy of $($f.Name); it may be changing. Quit the app and retry" }
+      $copied++
+    }
+    @{ Ok = $true; Detail = "$copied file(s) in $($c.BackupDir)" }
+  } catch {
+    @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+} @{ BackupDir = $backupDir; Files = $files }
+if (-not $r.Ok) {
+  Write-Host ''
+  Write-Host '  Stopped before changing anything.' -ForegroundColor Red
+  exit 1
+}
+
+# 2. Restore every parked server with mcp-toggle's own "on", which keeps each
+# file's formatting and writes it atomically.
+$r = Invoke-Step 'Restoring parked servers' {
+  param($c)
+  try {
+    if (-not (Test-Path -LiteralPath $c.Stash)) { return @{ Ok = $true; Detail = 'nothing was parked' } }
+    $parked = (Get-Content -LiteralPath $c.Stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    $restored = 0
+    $problems = @()
+    $created = @()
+    foreach ($app in $parked.PSObject.Properties) {
+      # An app whose config is gone (reinstalled, profile reset) still gets its servers back:
+      # start it from an empty config rather than lose them.
+      $target = $c.Apps | Where-Object { $_.id -eq $app.Name }
+      if ($target -and -not (Test-Path -LiteralPath $target.file)) {
+        New-Item -ItemType Directory -Force (Split-Path $target.file) | Out-Null
+        [IO.File]::WriteAllText($target.file, "{}`n", (New-Object Text.UTF8Encoding $false))
+        $created += $app.Name
+      }
+      foreach ($server in $app.Value.PSObject.Properties) {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $c.Node $c.Cli on $app.Name $server.Name 2>&1 | ForEach-Object {
+          if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+        }) -join ' '
+        if ($LASTEXITCODE -eq 0) { $restored++ } else { $problems += "$($app.Name)/$($server.Name): $($output.Trim())" }
+      }
+    }
+    if ($problems) { return @{ Ok = $false; Detail = "$restored restored; left parked: " + ($problems -join ' | ') } }
+    $note = if ($created) { " (new config file made for: $($created -join ', '))" } else { '' }
+    @{ Ok = $true; Detail = if ($restored) { "$restored server(s) restored$note" } else { 'nothing was parked' } }
+  } catch {
+    @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+} @{ Stash = $stash; Node = $nodeCommand; Cli = $cli; Apps = $apps }
+if (-not $r.Ok) { $failed = $true }
+
+# 3. Remove the shortcut and the sign-in reset.
+$r = Invoke-Step 'Removing the shortcut and sign-in reset' {
+  param($c)
+  try {
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $c.Installer -Uninstall 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or $output -notmatch 'Removed the desktop shortcut') { throw $output.Trim() }
+    @{ Ok = $true; Detail = '' }
+  } catch {
+    @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+} @{ Installer = $installer }
+if (-not $r.Ok) { $failed = $true }
+
+# 4. Check it all from the outside: nothing parked, nothing left behind.
+$r = Invoke-Step 'Checking that everything is back' {
+  param($c)
+  try {
+    $problems = @()
+    $ErrorActionPreference = 'Continue'
+    $listing = & $c.Node $c.Cli list 2>&1
+    $listExit = $LASTEXITCODE
+    $seen = @{}
+    foreach ($line in $listing) {
+      $parts = "$line" -split "`t"
+      if ($parts.Count -ge 3 -and $parts[1] -eq 'off') {
+        $seen["$($parts[0])/$($parts[2])"] = $true
+        $problems += "$($parts[2]) is still switched off in $($parts[0])"
+      } elseif ($parts.Count -eq 2) {
+        $problems += "$($parts[0]) config problem: $($parts[1])"
+      } elseif ($parts.Count -eq 1 -and "$line".Trim()) {
+        $problems += "unexpected output from list: $("$line".Trim())"
+      }
+    }
+    if ($listExit -ne 0) { $problems += "list exited with code $listExit" }
+    # `list` can't see an app whose config is missing, so read the parked list itself too.
+    if (Test-Path -LiteralPath $c.Stash) {
+      $left = (Get-Content -LiteralPath $c.Stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
+      foreach ($app in $left.PSObject.Properties) {
+        foreach ($server in $app.Value.PSObject.Properties) {
+          if (-not $seen["$($app.Name)/$($server.Name)"]) { $problems += "$($server.Name) is still parked for $($app.Name)" }
+        }
+      }
+    }
+    if (Get-ScheduledTask -TaskName $c.TaskName -ErrorAction SilentlyContinue) { $problems += 'the scheduled task is still there' }
+    if (Test-Path -LiteralPath $c.StartupLnk) { $problems += 'the Startup-folder shortcut is still there' }
+    if (Test-Path -LiteralPath $c.DesktopLnk) { $problems += 'the desktop shortcut is still there' }
+    if (Get-ItemProperty $c.RunKey -Name $c.RunName -ErrorAction SilentlyContinue) { $problems += 'the old Run entry is still there' }
+    if ($problems) { return @{ Ok = $false; Detail = ($problems -join '; ') } }
+    @{ Ok = $true; Detail = '' }
+  } catch {
+    @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+} @{ Node = $nodeCommand; Cli = $cli; Stash = $stash; TaskName = $taskName; StartupLnk = $startupLnk; DesktopLnk = $desktopLnk; RunKey = $runKey; RunName = $runName }
+if (-not $r.Ok) { $failed = $true }
+
+# 5. Only clean up once the check has passed, so a problem never costs you the
+# parked-server list.
+if ($failed) {
+  Write-Host '  [--] Keeping ~\.mcp-toggle, since something above needs a look' -ForegroundColor Yellow
+} elseif ($KeepData) {
+  Write-Host '  [--] Keeping ~\.mcp-toggle, as asked' -ForegroundColor Yellow
+} else {
+  $r = Invoke-Step 'Deleting ~\.mcp-toggle' {
+    param($c)
+    try {
+      Remove-Item -LiteralPath $c.StateDir -Recurse -Force -ErrorAction SilentlyContinue
+      if (Test-Path -LiteralPath $c.StateDir) { throw 'some files could not be deleted' }
+      @{ Ok = $true; Detail = '' }
+    } catch {
+      @{ Ok = $false; Detail = $_.Exception.Message }
+    }
+  } @{ StateDir = $stateDir }
+  if (-not $r.Ok) { $failed = $true }
+}
+
+Write-Host ''
+if ($failed) {
+  Write-Host '  Finished with problems.' -ForegroundColor Red
+  Write-Host "  Your files are backed up in $backupDir"
+  Write-Host '  Fix what is marked [!!] above and run this again; it is safe to repeat.'
+  exit 1
+}
+Write-Host '  Done. mcp-toggle is removed.' -ForegroundColor Green
+Write-Host "  Backup of the files it changed: $backupDir"
+Write-Host '  It can hold server settings such as API keys; delete it once your servers work.'
+Write-Host "  You can delete this folder too: $PSScriptRoot"
+exit 0

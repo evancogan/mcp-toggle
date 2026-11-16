@@ -32,6 +32,9 @@ Run the installer again after moving the repo or reinstalling Node.js, since the
 task and shortcut point at both by full path. `install.ps1 -Uninstall` removes
 the shortcut and the reset.
 
+To remove everything and put your servers back, run `uninstall.ps1`; see
+[UNINSTALL.md](UNINSTALL.md).
+
 ## Use
 
 Open the shortcut: ↑/↓ to move, Space to switch a server on or off, r to reload,
