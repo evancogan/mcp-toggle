@@ -104,11 +104,12 @@ if ($DryRun) {
       $parked = (Get-Content -LiteralPath $stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
       foreach ($app in $parked.PSObject.Properties) {
         $target = $apps | Where-Object { $_.id -eq $app.Name }
-        $ready = $target -and (Test-Path -LiteralPath $target.file)
+        $fresh = $target -and -not (Test-Path -LiteralPath $target.file)
         foreach ($server in $app.Value.PSObject.Properties) {
           $anyParked = $true
-          if ($ready) { Write-Host ("    {0}/{1}  -> restored into {2}" -f $app.Name, $server.Name, $target.file) }
-          else { Write-Host ("    {0}/{1}  -> CAN'T restore: that app's config file doesn't exist" -f $app.Name, $server.Name) -ForegroundColor Yellow }
+          if (-not $target) { Write-Host ("    {0}/{1}  -> CAN'T restore: mcp-toggle doesn't know an app called '{0}'" -f $app.Name, $server.Name) -ForegroundColor Yellow }
+          elseif ($fresh) { Write-Host ("    {0}/{1}  -> restored into a NEW {2} (it doesn't exist now)" -f $app.Name, $server.Name, $target.file) -ForegroundColor Yellow }
+          else { Write-Host ("    {0}/{1}  -> restored into {2}" -f $app.Name, $server.Name, $target.file) }
         }
       }
     } catch {
@@ -205,7 +206,16 @@ $r = Invoke-Step 'Restoring parked servers' {
     $parked = (Get-Content -LiteralPath $c.Stash -Raw).TrimStart([char]0xFEFF) | ConvertFrom-Json
     $restored = 0
     $problems = @()
+    $created = @()
     foreach ($app in $parked.PSObject.Properties) {
+      # An app whose config is gone (reinstalled, profile reset) still gets its servers back:
+      # start it from an empty config rather than lose them.
+      $target = $c.Apps | Where-Object { $_.id -eq $app.Name }
+      if ($target -and -not (Test-Path -LiteralPath $target.file)) {
+        New-Item -ItemType Directory -Force (Split-Path $target.file) | Out-Null
+        [IO.File]::WriteAllText($target.file, "{}`n", (New-Object Text.UTF8Encoding $false))
+        $created += $app.Name
+      }
       foreach ($server in $app.Value.PSObject.Properties) {
         $ErrorActionPreference = 'Continue'
         $output = (& $c.Node $c.Cli on $app.Name $server.Name 2>&1 | ForEach-Object {
@@ -215,11 +225,12 @@ $r = Invoke-Step 'Restoring parked servers' {
       }
     }
     if ($problems) { return @{ Ok = $false; Detail = "$restored restored; left parked: " + ($problems -join ' | ') } }
-    @{ Ok = $true; Detail = if ($restored) { "$restored server(s) restored" } else { 'nothing was parked' } }
+    $note = if ($created) { " (new config file made for: $($created -join ', '))" } else { '' }
+    @{ Ok = $true; Detail = if ($restored) { "$restored server(s) restored$note" } else { 'nothing was parked' } }
   } catch {
     @{ Ok = $false; Detail = $_.Exception.Message }
   }
-} @{ Stash = $stash; Node = $nodeCommand; Cli = $cli }
+} @{ Stash = $stash; Node = $nodeCommand; Cli = $cli; Apps = $apps }
 if (-not $r.Ok) { $failed = $true }
 
 # 3. Remove the shortcut and the sign-in reset.
