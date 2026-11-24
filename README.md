@@ -150,3 +150,7 @@ node --test
 ```
 
 The tests work on temp files only; they never read or change your configs.
+
+## AI attribution
+
+Claude (Anthropic) helped write the code in this project, working under my direction.
