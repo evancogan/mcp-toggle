@@ -151,6 +151,6 @@ node --test
 
 The tests work on temp files only; they never read or change your configs.
 
-## AI attribution
+## How it was built
 
-Claude (Anthropic) wrote most of the code in this project under my direction, through branches and pull requests that I reviewed.
+I built this with Claude as a pair programmer. I designed how it works, wrote parts of the code, directed the rest, and reviewed every change through pull requests.
