@@ -153,4 +153,4 @@ The tests work on temp files only; they never read or change your configs.
 
 ## AI attribution
 
-Claude (Anthropic) helped write the code in this project, working under my direction.
+Claude (Anthropic) wrote most of the code in this project under my direction, through branches and pull requests that I reviewed.
