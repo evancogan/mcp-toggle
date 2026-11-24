@@ -1,5 +1,7 @@
 # mcp-toggle
 
+![Node](https://img.shields.io/badge/Node.js-20+-339933?logo=nodedotjs&logoColor=white) ![Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
+
 One list for switching MCP servers on and off across Claude Desktop, Claude Code
 and LM Studio on Windows. Every server is switched off each time you sign in, so
 nothing runs until you turn it on.
